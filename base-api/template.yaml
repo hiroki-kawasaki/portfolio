@@ -1,0 +1,158 @@
+AWSTemplateFormatVersion: 2010-09-09
+Transform: AWS::Serverless-2016-10-31
+Description: Portfolio Base API
+
+
+Parameters:
+    AppGroupName:
+        Type: String
+        Default: portfolio
+    AppName:
+        Type: String
+        Default: base
+    AppStage:
+        Type: AWS::SSM::Parameter::Value<String>
+        Default: /account/application-stage
+    ACMCertificateArn:
+        Type: AWS::SSM::Parameter::Value<String>
+        Default: /portfolio/acm/certificate/ap-northeast-1
+    Python313Arm64SlimLayerArn:
+        Type: AWS::SSM::Parameter::Value<String>
+        Default: /portfolio-sdk/lambda-layer/python313-arm64-slim
+    AuthorizerGuestFunctionArn:
+        Type: AWS::SSM::Parameter::Value<String>
+        Default: /portfolio-id/authorizer/guest/lambda-function-arn
+    AuthorizerMemberFunctionArn:
+        Type: AWS::SSM::Parameter::Value<String>
+        Default: /portfolio-id/authorizer/member/lambda-function-arn
+
+
+Conditions:
+    IsPrd: !Equals
+        - !Ref AppStage
+        - prd
+    IsDev: !Equals
+        - !Ref AppStage
+        - dev
+
+
+Globals:
+    Function:
+        Handler: app.lambda_handler
+        Runtime: python3.13
+        Architectures:
+            - arm64
+        Layers:
+            - !Ref Python313Arm64SlimLayerArn
+        LoggingConfig:
+            LogGroup: !Sub "${AppGroupName}-${AppName}"
+            LogFormat: JSON
+        Environment:
+            Variables:
+                APP_GROUP_NAME: !Ref AppGroupName
+                APP_NAME: !Ref AppName
+                APP_STAGE: !Ref AppStage
+                MAIN_TABLE_NAME: !Ref MainTable
+        Tags:
+            aws-lambda-warmup-target: 'true'
+
+
+Resources:
+    MainTable:
+        Type: AWS::DynamoDB::Table
+        UpdateReplacePolicy: !If [IsDev, 'Delete', 'Retain']
+        DeletionPolicy: !If [IsDev, 'Delete', 'Retain']
+        Properties:
+            AttributeDefinitions:
+                - AttributeName: PK
+                  AttributeType: S
+                - AttributeName: SK
+                  AttributeType: S
+            KeySchema:
+                - AttributeName: PK
+                  KeyType: HASH
+                - AttributeName: SK
+                  KeyType: RANGE
+            BillingMode: PAY_PER_REQUEST
+            DeletionProtectionEnabled: !If [IsDev, False, True]
+            PointInTimeRecoverySpecification:
+                PointInTimeRecoveryEnabled: !If [IsDev, False, True]
+            TimeToLiveSpecification:
+                AttributeName: TTL
+                Enabled: True
+
+    MainTableReadPolicy:
+        Type: AWS::IAM::ManagedPolicy
+        Properties:
+            PolicyDocument:
+                Version: 2012-10-17
+                Statement:
+                    - Effect: Allow
+                      Action:
+                          - dynamodb:BatchGetItem
+                          - dynamodb:GetItem
+                          - dynamodb:Query
+                      Resource:
+                          - !GetAtt MainTable.Arn
+                          - !Sub '${MainTable.Arn}/index/*'
+
+    MainTableReadWritePolicy:
+        Type: AWS::IAM::ManagedPolicy
+        Properties:
+            PolicyDocument:
+                Version: 2012-10-17
+                Statement:
+                    - Effect: Allow
+                      Action:
+                          - dynamodb:BatchGetItem
+                          - dynamodb:GetItem
+                          - dynamodb:Query
+                          - dynamodb:BatchWriteItem
+                          - dynamodb:PutItem
+                          - dynamodb:UpdateItem
+                          - dynamodb:DeleteItem
+                      Resource:
+                          - !GetAtt MainTable.Arn
+                          - !Sub '${MainTable.Arn}/index/*'
+
+
+    HttpApi:
+        Type: AWS::Serverless::HttpApi
+        Properties:
+            Auth:
+                Authorizers:
+                    GuestAuthorizer:
+                        AuthorizerPayloadFormatVersion: 2.0
+                        FunctionArn: !Ref AuthorizerGuestFunctionArn
+                        EnableFunctionDefaultPermissions: true
+                        EnableSimpleResponses: true
+                        Identity:
+                            ReauthorizeEvery: 30
+                            Context:
+                                - path
+                            Headers:
+                                - X-Server-Signature
+                    MemberAuthorizer:
+                        AuthorizerPayloadFormatVersion: 2.0
+                        FunctionArn: !Ref AuthorizerMemberFunctionArn
+                        EnableFunctionDefaultPermissions: true
+                        EnableSimpleResponses: true
+                        Identity:
+                            ReauthorizeEvery: 30
+                            Context:
+                                - path
+                            Headers:
+                                - Authorization
+                                - X-Server-Signature
+                DefaultAuthorizer: MemberAuthorizer
+            Domain:
+                DomainName: !If
+                    - IsPrd
+                    - !Sub "${AppName}.portfolio.com"
+                    - !Sub "${AppName}.${AppStage}.portfolio.com"
+                CertificateArn: !Ref ACMCertificateArn
+                Route53:
+                    HostedZoneName: !If
+                        - IsPrd
+                        - "portfolio.com."
+                        - !Sub "${AppStage}.portfolio.com."

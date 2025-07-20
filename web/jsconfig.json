@@ -1,0 +1,14 @@
+{
+  "compilerOptions": {
+    "paths": {
+      "@a/*": ["./src/actions/*"],
+      "@c/*": ["./src/components/*"],
+      "@s-c/*": ["./src/components/server/*"],
+      "@c-c/*": ["./src/components/client/*"],
+      "@f/*": ["./src/functions/*"],
+      "@f-s/*": ["./src/functions/server/*"],
+      "@f-c/*": ["./src/functions/client/*"],
+      "@d/*": ["./src/dataset/*"]
+    }
+  }
+}

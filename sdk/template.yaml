@@ -1,0 +1,107 @@
+AWSTemplateFormatVersion: 2010-09-09
+Transform: AWS::Serverless-2016-10-31
+Description: Portfolio SDK
+
+
+
+Parameters:
+    AppGroupName:
+        Type: String
+        Default: Portfolio
+    AppName:
+        Type: String
+        Default: sdk
+    AppStage:
+        Type: AWS::SSM::Parameter::Value<String>
+        Default: '/account/application-stage'
+
+
+
+Conditions:
+    IsDev: !Equals
+        - !Ref AppStage
+        - dev
+
+
+
+Globals:
+    Function:
+        Handler: app.lambda_handler
+        Runtime: python3.13
+        Architectures:
+            - arm64
+        LoggingConfig:
+            LogGroup: !Sub "${AppGroupName}-${AppName}"
+            LogFormat: JSON
+        Environment:
+            Variables:
+                APP_GROUP_NAME: !Ref AppGroupName
+                APP_NAME: !Ref AppName
+                APP_STAGE: !Ref AppStage
+        Tags:
+            aws-lambda-warmup-target: 'false'
+
+
+
+Resources:
+    WarmupScheduleGroup:
+        Type: AWS::Scheduler::ScheduleGroup
+
+    WarmupFunction:
+        Type: AWS::Serverless::Function
+        Properties:
+            CodeUri: warmup
+            Timeout: 30
+            MemorySize: 1024
+            Events:
+                Scheduler:
+                    Type: ScheduleV2
+                    Properties:
+                        GroupName: !Ref WarmupScheduleGroup
+                        ScheduleExpression: rate(5 minutes)
+                        FlexibleTimeWindow:
+                            MaximumWindowInMinutes: 5
+                            Mode: FLEXIBLE
+                        State: !If [IsDev, DISABLED, ENABLED]
+            Policies:
+                - Version: '2012-10-17'
+                  Statement:
+                      - Effect: Allow
+                        Action: tag:GetResources
+                        Resource: '*'
+                      - Effect: Allow
+                        Action: lambda:InvokeFunction
+                        Resource: !Join
+                            - ':'
+                            - - 'arn:aws:lambda'
+                              - !Ref AWS::Region
+                              - !Ref AWS::AccountId
+                              - 'function:*'
+                        Condition:
+                            StringEquals:
+                                'aws:ResourceTag/application-group-name': !Ref AppGroupName
+                                'aws:ResourceTag/aws-lambda-warmup-target': 'true'
+
+
+    Python313Arm64SlimLayer:
+        Type: AWS::Serverless::LayerVersion
+        Properties:
+            CompatibleArchitectures:
+                - arm64
+            CompatibleRuntimes:
+                - python3.13
+            ContentUri: lambda-layer/python/slim
+            RetentionPolicy: Delete
+        Metadata:
+            BuildMethod: python3.13
+            BuildArchitecture: arm64
+
+
+    Python313Arm64SlimLayerArnParameter:
+        Type: AWS::SSM::Parameter
+        Properties:
+            Name: !Sub "/${AppGroupName}-${AppName}/lambda-layer/python313-arm64-slim"
+            Description: 'Portfolio SDK / Lambda Layer - Python3.13 Arm64 - slim'
+            Type: String
+            DataType: text
+            Value: !Ref Python313Arm64SlimLayer

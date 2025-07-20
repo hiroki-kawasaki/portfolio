@@ -1,0 +1,293 @@
+AWSTemplateFormatVersion: 2010-09-09
+Transform: AWS::Serverless-2016-10-31
+Description: Portfolio ID API
+
+
+
+Parameters:
+    AppGroupName:
+        Type: String
+        Default: portfolio
+    AppName:
+        Type: String
+        Default: id
+    AppStage:
+        Type: AWS::SSM::Parameter::Value<String>
+        Default: /account/application-stage
+    GoogleClientId:
+        Type: AWS::SSM::Parameter::Value<String>
+        Default: /portfolio/google/client-id
+    GoogleClientSecret:
+        Type: String
+        NoEcho: true
+        Description: Your Google Client Secret for the OAuth 2.0 client.
+    ACMCertificateArn:
+        Type: AWS::SSM::Parameter::Value<String>
+        Default: /portfolio/acm/certificate
+    CognitoCallbackURLs:
+        Type: CommaDelimitedList
+    WebClientURLs:
+        Type: CommaDelimitedList
+    Python313Arm64SlimLayerArn:
+        Type: AWS::SSM::Parameter::Value<String>
+        Default: /portfolio-sdk/lambda-layer/python313-arm64-slim
+
+
+
+Conditions:
+    IsPrd: !Equals
+        - !Ref AppStage
+        - prd
+    IsDev: !Equals
+        - !Ref AppStage
+        - dev
+
+
+
+Globals:
+    Function:
+        Handler: app.lambda_handler
+        Runtime: python3.13
+        Architectures:
+            - arm64
+        Layers:
+            - !Ref Python313Arm64SlimLayerArn
+        LoggingConfig:
+            LogGroup: !Sub "${AppGroupName}-${AppName}-api"
+            LogFormat: JSON
+        Environment:
+            Variables:
+                APP_GROUP_NAME: !Ref AppGroupName
+                APP_NAME: !Ref AppName
+                APP_STAGE: !Ref AppStage
+                MAIN_TABLE_NAME: !Ref MainTable
+        Tags:
+            aws-lambda-warmup-target: 'true'
+
+
+
+Resources:
+    MainTable:
+        Type: AWS::DynamoDB::Table
+        UpdateReplacePolicy: !If [IsDev, 'Delete', 'Retain']
+        DeletionPolicy: !If [IsDev, 'Delete', 'Retain']
+        Properties:
+            AttributeDefinitions:
+                - AttributeName: PK
+                  AttributeType: S
+                - AttributeName: SK
+                  AttributeType: S
+            KeySchema:
+                - AttributeName: PK
+                  KeyType: HASH
+                - AttributeName: SK
+                  KeyType: RANGE
+            BillingMode: PAY_PER_REQUEST
+            DeletionProtectionEnabled: !If [IsDev, False, True]
+            PointInTimeRecoverySpecification:
+                PointInTimeRecoveryEnabled: !If [IsDev, False, True]
+            TimeToLiveSpecification:
+                AttributeName: TTL
+                Enabled: True
+
+    MainTableReadPolicy:
+        Type: AWS::IAM::ManagedPolicy
+        Properties:
+            PolicyDocument:
+                Version: 2012-10-17
+                Statement:
+                    - Effect: Allow
+                      Action:
+                          - dynamodb:BatchGetItem
+                          - dynamodb:GetItem
+                          - dynamodb:Query
+                      Resource:
+                          - !GetAtt MainTable.Arn
+                          - !Sub '${MainTable.Arn}/index/*'
+
+    MainTableReadWritePolicy:
+        Type: AWS::IAM::ManagedPolicy
+        Properties:
+            PolicyDocument:
+                Version: 2012-10-17
+                Statement:
+                    - Effect: Allow
+                      Action:
+                          - dynamodb:BatchGetItem
+                          - dynamodb:GetItem
+                          - dynamodb:Query
+                          - dynamodb:BatchWriteItem
+                          - dynamodb:PutItem
+                          - dynamodb:UpdateItem
+                          - dynamodb:DeleteItem
+                      Resource:
+                          - !GetAtt MainTable.Arn
+                          - !Sub '${MainTable.Arn}/index/*'
+
+
+    CognitoUserPool:
+        Type: AWS::Cognito::UserPool
+        UpdateReplacePolicy: !If [IsDev, 'Delete', 'Retain']
+        DeletionPolicy: !If [IsDev, 'Delete', 'Retain']
+        Properties:
+            DeletionProtection: !If [IsDev, 'INACTIVE', 'ACTIVE']
+            UsernameAttributes:
+                - email
+            UsernameConfiguration:
+                CaseSensitive: False
+            MfaConfiguration: OPTIONAL
+            EnabledMfas:
+                - SOFTWARE_TOKEN_MFA
+            LambdaConfig:
+                PreTokenGenerationConfig:
+                    LambdaArn: !GetAtt CognitoUserPoolPreTokenGenerationFunction.Arn
+                    LambdaVersion: V3_0
+
+    CognitoUserPoolDomain:
+        Type: AWS::Cognito::UserPoolDomain
+        Properties:
+            UserPoolId: !Ref CognitoUserPool
+            ManagedLoginVersion: 1
+            Domain: !If
+                - IsPrd
+                - !Sub "auth.portfolio.com"
+                - !Sub "auth.${AppStage}.portfolio.com"
+            CustomDomainConfig:
+                CertificateArn: !Ref ACMCertificateArn
+
+    CognitoUserPoolGoogleIdP:
+        Type: AWS::Cognito::UserPoolIdentityProvider
+        Properties:
+            UserPoolId: !Ref CognitoUserPool
+            ProviderName: Google
+            ProviderType: Google
+            ProviderDetails:
+                client_id: !Ref GoogleClientId
+                client_secret: !Ref GoogleClientSecret
+                authorize_scopes: email profile openid
+            AttributeMapping:
+                email: email
+                username: sub
+
+    CognitoUserPoolClient:
+        Type: AWS::Cognito::UserPoolClient
+        DependsOn: CognitoUserPoolGoogleIdP
+        Properties:
+            UserPoolId: !Ref CognitoUserPool
+            ClientName: portfolio-web
+            AllowedOAuthFlows:
+                - code
+            AllowedOAuthScopes:
+                - email
+                - openid
+                - profile
+            SupportedIdentityProviders:
+                - Google
+            EnablePropagateAdditionalUserContextData: True
+            AllowedOAuthFlowsUserPoolClient: True
+            GenerateSecret: True
+            AuthSessionValidity: 3
+            AccessTokenValidity: 5
+            IdTokenValidity: 5
+            RefreshTokenValidity: 730
+            TokenValidityUnits:
+                AccessToken: minutes
+                IdToken: minutes
+                RefreshToken: days
+            RefreshTokenRotation:
+                Feature: ENABLED
+                RetryGracePeriodSeconds: 10
+            ExplicitAuthFlows:
+                - ALLOW_USER_SRP_AUTH
+            CallbackURLs: !Ref CognitoCallbackURLs
+            LogoutURLs: !Ref WebClientURLs
+            PreventUserExistenceErrors: ENABLED
+
+
+    CognitoUserPoolPreSignupFunction:
+        Type: AWS::Serverless::Function
+        Properties:
+            CodeUri: cognito/pre-signup
+            MemorySize: 320
+            Events:
+                CognitoPreSignUp:
+                    Type: Cognito
+                    Properties:
+                        UserPool: !Ref CognitoUserPool
+                        Trigger: PreSignUp
+            Policies:
+                - !Ref MainTableReadWritePolicy
+
+    CognitoUserPoolPreTokenGenerationFunction:
+        Type: AWS::Serverless::Function
+        Properties:
+            CodeUri: cognito/pre-token-generation
+            MemorySize: 288
+            Events:
+                CognitoPreTokenGeneration:
+                    Type: Cognito
+                    Properties:
+                        UserPool: !Ref CognitoUserPool
+                        Trigger: PreTokenGeneration
+            Policies:
+                - !Ref MainTableReadWritePolicy
+
+
+    AuthorizerGuestFunction:
+        Type: AWS::Serverless::Function
+        Properties:
+            CodeUri: authorizer
+            Handler: app.guest
+            MemorySize: 368
+            Environment:
+                Variables:
+                    M2M_ISSUERS: !Join [",", !Ref WebClientURLs]
+
+    AuthorizerMemberFunction:
+        Type: AWS::Serverless::Function
+        Properties:
+            CodeUri: authorizer
+            Handler: app.member
+            MemorySize: 368
+            Environment:
+                Variables:
+                    M2M_ISSUERS: !Join [",", !Ref WebClientURLs]
+                    IDP_CLIENT_ID: !Ref CognitoUserPoolClient
+                    IDP_ISSUER: !Sub "https://cognito-idp.${AWS::Region}.amazonaws.com/${CognitoUserPool}"
+
+
+    CognitoUserPoolIdParameter:
+        Type: AWS::SSM::Parameter
+        Properties:
+            Name: !Sub "/${AppGroupName}-${AppName}/cognito/userpool-id"
+            Description: Portfolio ID / Cognito - UserPool ID
+            Type: String
+            DataType: text
+            Value: !Ref CognitoUserPool
+
+    CognitoUserPoolClientIdParameter:
+        Type: AWS::SSM::Parameter
+        Properties:
+            Name: !Sub "/${AppGroupName}-${AppName}/cognito/userpool-client-id"
+            Description: Portfolio ID / Cognito - UserPool Client ID
+            Type: String
+            DataType: text
+            Value: !Ref CognitoUserPoolClient
+
+    AuthorizerGuestFunctionArnParameter:
+        Type: AWS::SSM::Parameter
+        Properties:
+            Name: !Sub "/${AppGroupName}-${AppName}/authorizer/guest/lambda-function-arn"
+            Description: Portfolio ID / Lambda - API Gateway Guest Authorizer Function ARN
+            Type: String
+            DataType: text
+            Value: !GetAtt AuthorizerGuestFunction.Arn
+
+    AuthorizerMemberFunctionArnParameter:
+        Type: AWS::SSM::Parameter
+        Properties:
+            Name: !Sub "/${AppGroupName}-${AppName}/authorizer/member/lambda-function-arn"
+            Description: Portfolio ID / Lambda - API Gateway Member Authorizer Function ARN
+            Type: String
+            DataType: text
+            Value: !GetAtt AuthorizerMemberFunction.Arn

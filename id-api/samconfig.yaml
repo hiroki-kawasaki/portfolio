@@ -1,0 +1,15 @@
+version: 0.1
+default:
+    build:
+        parameters:
+            cached: true
+            parallel: true
+    validate:
+        parameters:
+            lint: true
+    deploy:
+        parameters:
+            region: ap-northeast-1
+            capabilities: CAPABILITY_NAMED_IAM
+            confirm_changeset: false
+            on_failure: DELETE
